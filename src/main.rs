@@ -242,7 +242,7 @@ async fn generate_data(
         })
         .collect();
 
-    println!("Combinding Data.");
+    println!("\nCombinding Data.");
     let mut output = Vec::with_capacity(target_size + 1024);
 
     for chunk in chunks {
@@ -253,6 +253,7 @@ async fn generate_data(
     println!("Done.");
 
     progress.lock().print_progress();
+
     Ok(HttpResponse::Ok()
         .insert_header(("Content-Encoding", "gzip"))
         .insert_header(("Content-Type", "application/json"))
