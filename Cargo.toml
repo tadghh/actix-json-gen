@@ -4,7 +4,7 @@ name   ="json-gen-actix"
 version="0.1.0"
 
 [dependencies]
-actix-web  ={ version="4.9.0", default-features=false, features=["compress-gzip", "macros"] }
+actix-web  ={ version="4.9.0", default-features=false, features=["macros"] }
 fake       ={ version="3.1.0", default-features=false, features=["derive"] }
 num_cpus   ="1.16.0"
 parking_lot="0.12.3"
@@ -15,6 +15,7 @@ serde      ={ version="1.0.217", features=["derive"] }
 
 [profile.release]
 codegen-units=1
+debug        =false
 lto          ="thin"
 opt-level    ="z"
 panic        ="abort"

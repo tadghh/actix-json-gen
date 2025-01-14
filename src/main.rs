@@ -1,169 +1,17 @@
-#![feature(get_mut_unchecked)]
-
+#![feature(get_mut_unchecked, portable_simd)]
 use actix_web::{web, App, Error, HttpResponse, HttpServer};
-use fake::faker::address::en::*;
-use fake::faker::company::en::*;
-use fake::Fake;
+
 use parking_lot::Mutex;
+use processing::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
-use serde::Serialize;
+
 use std::collections::HashMap;
 use std::io::{stdout, Write};
 
 use std::sync::Arc;
-
-#[derive(Serialize)]
-struct BusinessLocation {
-    id: u32,
-    name: String,
-    industry: String,
-    revenue: f32,
-    employees: u32,
-    city: String,
-    state: String,
-    country: String,
-}
-
-struct DataPools {
-    names: Vec<String>,
-    industries: Vec<String>,
-    cities: Vec<String>,
-    states: Vec<String>,
-    countries: Vec<String>,
-}
-
-struct ChunkResult {
-    data: Vec<u8>,
-    count: usize,
-}
-
-impl DataPools {
-    fn new() -> Self {
-        let pool_size = 1000;
-        DataPools {
-            names: (0..pool_size).map(|_| CompanyName().fake()).collect(),
-            industries: (0..pool_size).map(|_| Industry().fake()).collect(),
-            cities: (0..pool_size).map(|_| CityName().fake()).collect(),
-            states: (0..pool_size).map(|_| StateName().fake()).collect(),
-            countries: (0..50).map(|_| CountryName().fake()).collect(),
-        }
-    }
-}
-
-#[inline]
-fn generate_chunk(
-    start_id: u32,
-    target_chunk_size: usize,
-    pools: &DataPools,
-    mut rng: ChaCha8Rng,
-    pretty: bool,
-    is_first: bool,
-    mut progress: Arc<Mutex<ProgressInfo>>,
-) -> ChunkResult {
-    let mut output = Vec::with_capacity(target_chunk_size + 1024);
-    if is_first {
-        output.extend_from_slice(if pretty { b"[\n  " } else { b"[" });
-    }
-
-    let mut count = 0;
-    let mut current_id = start_id;
-    let separa = if pretty {
-        ",\n    ".to_string()
-    } else {
-        ",".to_string()
-    };
-    let separator = separa.as_bytes();
-    let line_en: String = if pretty {
-        "\n  }".to_string()
-    } else {
-        "}".to_string()
-    };
-    let line_end = line_en.as_bytes();
-    while output.len() < target_chunk_size {
-        if count > 0 || !is_first {
-            output.extend_from_slice(if pretty { b",\n  " } else { b"," });
-        }
-
-        let random_number = rng.gen_range(0..100);
-        let location = BusinessLocation {
-            id: current_id,
-            name: pools.names[random_number].clone(),
-            industry: pools.industries[random_number].clone(),
-            revenue: rng.gen_range(100000.0..100000000.0),
-            employees: rng.gen_range(10..10000),
-            city: pools.cities[random_number].clone(),
-            state: pools.states[random_number].clone(),
-            country: pools.countries[rng.gen_range(0..5)].clone(),
-        };
-
-        output.extend_from_slice(b"{");
-        if pretty {
-            output.extend_from_slice(b"\n    ");
-        }
-
-        output.extend_from_slice(b"\"id\": ");
-        output.extend_from_slice(location.id.to_string().as_bytes());
-
-        output.extend_from_slice(separator);
-        output.extend_from_slice(b"\"name\": \"");
-        output.extend_from_slice(location.name.as_bytes());
-        output.extend_from_slice(b"\"");
-
-        output.extend_from_slice(separator);
-        output.extend_from_slice(b"\"industry\": \"");
-        output.extend_from_slice(location.industry.as_bytes());
-        output.extend_from_slice(b"\"");
-
-        output.extend_from_slice(separator);
-        output.extend_from_slice(b"\"revenue\": ");
-        output.extend_from_slice(location.revenue.to_string().as_bytes());
-
-        output.extend_from_slice(separator);
-        output.extend_from_slice(b"\"employees\": ");
-        output.extend_from_slice(location.employees.to_string().as_bytes());
-
-        output.extend_from_slice(separator);
-        output.extend_from_slice(b"\"city\": \"");
-        output.extend_from_slice(location.city.as_bytes());
-        output.extend_from_slice(b"\"");
-
-        output.extend_from_slice(separator);
-        output.extend_from_slice(b"\"state\": \"");
-        output.extend_from_slice(location.state.as_bytes());
-        output.extend_from_slice(b"\"");
-
-        output.extend_from_slice(separator);
-        output.extend_from_slice(b"\"country\": \"");
-        output.extend_from_slice(location.country.as_bytes());
-        output.extend_from_slice(b"\"");
-
-        output.extend_from_slice(line_end);
-
-        // It'll be fine.
-        unsafe {
-            let progress_locked = Arc::get_mut_unchecked(&mut progress);
-
-            // yay
-            progress_locked.force_unlock();
-            progress_locked.get_mut().update(output.len());
-        }
-
-        // Numbers only go up!
-        if count % 1500 == 0 {
-            progress.lock().print_progress();
-        }
-
-        count += 1;
-        current_id += 1;
-    }
-
-    ChunkResult {
-        data: output,
-        count,
-    }
-}
+mod processing;
 
 fn parse_size(size_str: &str) -> Result<usize, String> {
     let size_str = size_str.to_lowercase();
@@ -200,6 +48,7 @@ async fn generate_data(
     };
 
     let pretty = params.get("pretty").map_or(false, |v| v == "true");
+    let format = OutputFormat::from_str(params.get("format").map_or("json", |s| s));
     let seed: u64 = rand::thread_rng().gen();
 
     let num_threads = num_cpus::get();
@@ -216,9 +65,19 @@ async fn generate_data(
     println!("------------------------------------");
     println!("Requested size: {:.2}MB", target_size / (BYTE_SIZE));
     println!(
-        "Pretty print: {}",
-        params.get("pretty").map_or("false", |v| v)
+        "Format: {}",
+        if format == OutputFormat::JSON {
+            "JSON"
+        } else {
+            "CSV"
+        }
     );
+    if format == OutputFormat::JSON {
+        println!(
+            "Pretty print: {}",
+            params.get("pretty").map_or("false", |v| v)
+        );
+    }
 
     let chunks: Vec<ChunkResult> = (0..num_threads)
         .into_par_iter()
@@ -234,6 +93,7 @@ async fn generate_data(
                 chunk_rng,
                 pretty,
                 is_first,
+                &format,
                 progress.clone(),
             );
             *total_generated.lock() += result.count;
@@ -242,21 +102,22 @@ async fn generate_data(
         })
         .collect();
 
-    println!("\nCombinding Data.");
+    println!("\nCombining Data.");
     let mut output = Vec::with_capacity(target_size + 1024);
 
     for chunk in chunks {
         output.extend(chunk.data);
     }
-    output.extend_from_slice(if pretty { b"\n]\n" } else { b"]" });
+
+    if format == OutputFormat::JSON {
+        output.extend_from_slice(if pretty { b"\n]\n" } else { b"]" });
+    }
 
     println!("Done.");
-
     progress.lock().print_progress();
 
     Ok(HttpResponse::Ok()
-        .insert_header(("Content-Encoding", "gzip"))
-        .insert_header(("Content-Type", "application/json"))
+        .insert_header(("Content-Type", format.content_type()))
         .body(output))
 }
 
