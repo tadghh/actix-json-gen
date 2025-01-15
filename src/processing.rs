@@ -54,7 +54,6 @@ pub struct DataPools {
 
 pub struct ChunkResult {
     pub data: Vec<u8>,
-    pub count: usize,
 }
 
 impl DataPools {
@@ -89,21 +88,15 @@ pub fn generate_chunk(
         output.extend_from_slice(if pretty { b"[\n  " } else { b"[" });
     }
 
-    let mut count = 0;
     let mut current_id = start_id;
+    let mut is_start = is_first;
 
     while output.len() < target_chunk_size {
-        if count > 0 || !is_first {
-            if *format == OutputFormat::JSON {
-                output.extend_from_slice(if pretty { b",\n  " } else { b"," });
-            }
-        }
-
         let random_number = rng.gen_range(0..100);
         let location = BusinessLocation {
             id: current_id,
             name: pools.names[random_number].clone(),
-            industry: pools.industries[random_number].clone(),
+            industry: pools.industries[random_number].clone().replace(",", ""),
             revenue: rng.gen_range(100000.0..100000000.0),
             employees: rng.gen_range(10..10000),
             city: pools.cities[random_number].clone(),
@@ -113,12 +106,15 @@ pub fn generate_chunk(
 
         match format {
             OutputFormat::JSON => {
-                write_location_json_simd(&location, &mut output, pretty, &json_patterns);
+                write_location_json_simd(&location, &mut output, pretty, &json_patterns, is_start);
             }
             OutputFormat::CSV => {
                 write_location_csv_simd(&location, &mut output);
             }
         }
+
+        current_id += 1;
+        is_start = false;
 
         unsafe {
             let progress_locked = Arc::get_mut_unchecked(&mut progress);
@@ -126,18 +122,12 @@ pub fn generate_chunk(
             progress_locked.get_mut().update(output.len());
         }
 
-        if count % 1500 == 0 {
+        if current_id % 1500 == 0 {
             progress.lock().print_progress();
         }
-
-        count += 1;
-        current_id += 1;
     }
 
-    ChunkResult {
-        data: output,
-        count,
-    }
+    ChunkResult { data: output }
 }
 
 #[inline]
@@ -202,12 +192,10 @@ fn copy_str_simd(output: &mut Vec<u8>, s: &str) {
 
 // Pre-computed patterns for both pretty and compact modes
 struct JsonPatterns {
-    field_start_pretty: [u8; 32],  // "\n    \"
-    field_start_compact: [u8; 32], // "\"
-    separator_pretty: [u8; 32],    // ",\n    "
-    separator_compact: [u8; 32],   // ","
-    ending_pretty: [u8; 32],       // "\n  }"
-    ending_compact: [u8; 32],      // "}"
+    separator_pretty: [u8; 32],  // ",\n    "
+    separator_compact: [u8; 32], // ","
+    ending_pretty: [u8; 32],     // "\n  }"
+    ending_compact: [u8; 32],    // "}"
     quoted_field_patterns: [QuotedFieldPattern; 5],
     unquoted_field_patterns: [UnquotedFieldPattern; 3],
 }
@@ -262,8 +250,6 @@ impl JsonPatterns {
         .map(|(_, pattern)| pattern);
 
         Self {
-            field_start_pretty,
-            field_start_compact,
             separator_pretty,
             separator_compact,
             ending_pretty,
@@ -279,11 +265,12 @@ fn create_quoted_pattern(field_name: &[u8]) -> QuotedFieldPattern {
     let mut prefix = [0u8; 32];
     let mut suffix = [0u8; 32];
 
-    let prefix_content = [b'"'];
-    prefix[..1].copy_from_slice(&prefix_content);
+    // Format: "field_name": "
+    prefix[0] = b'"';
     prefix[1..1 + field_name.len()].copy_from_slice(field_name);
     prefix[1 + field_name.len()..1 + field_name.len() + 4].copy_from_slice(b"\": \"");
 
+    // Just the closing quote
     suffix[0] = b'"';
 
     QuotedFieldPattern {
@@ -298,8 +285,8 @@ fn create_quoted_pattern(field_name: &[u8]) -> QuotedFieldPattern {
 fn create_unquoted_pattern(field_name: &[u8]) -> UnquotedFieldPattern {
     let mut prefix = [0u8; 32];
 
-    let prefix_content = [b'"'];
-    prefix[..1].copy_from_slice(&prefix_content);
+    // Format: "field_name":
+    prefix[0] = b'"';
     prefix[1..1 + field_name.len()].copy_from_slice(field_name);
     prefix[1 + field_name.len()..1 + field_name.len() + 3].copy_from_slice(b"\": ");
 
@@ -315,47 +302,55 @@ fn write_location_json_simd(
     output: &mut Vec<u8>,
     pretty: bool,
     patterns: &JsonPatterns,
+    is_first: bool,
 ) {
+    // Add comma if not first object
+    if !is_first {
+        output.extend_from_slice(if pretty { b",\n  " } else { b"," });
+    }
+
     // Pre-convert numbers to strings once
     let id_str = location.id.to_string();
     let revenue_str = location.revenue.to_string();
     let employees_str = location.employees.to_string();
 
     // Select patterns based on pretty flag
-    let (field_start, separator, ending) = if pretty {
-        (
-            &patterns.field_start_pretty,
-            &patterns.separator_pretty,
-            &patterns.ending_pretty,
-        )
+    let (separator, ending) = if pretty {
+        (&patterns.separator_pretty, &patterns.ending_pretty)
     } else {
-        (
-            &patterns.field_start_compact,
-            &patterns.separator_compact,
-            &patterns.ending_compact,
-        )
+        (&patterns.separator_compact, &patterns.ending_compact)
     };
 
     // Initial brace and formatting
     output.push(b'{');
-    output.extend_from_slice(&field_start[..if pretty { 6 } else { 1 }]);
 
-    // Unquoted fields (id, revenue, employees)
-    let values = [&id_str, &revenue_str, &employees_str];
-    for (i, (pattern, value)) in patterns
-        .unquoted_field_patterns
-        .iter()
-        .zip(values.iter())
-        .enumerate()
-    {
-        if i > 0 {
-            output.extend_from_slice(&separator[..if pretty { 6 } else { 1 }]);
-        }
-        output.extend_from_slice(&pattern.prefix[..pattern.prefix_len]);
-        output.extend_from_slice(value.as_bytes());
+    // Write id (first field, no leading comma)
+    if pretty {
+        output.extend_from_slice(b"\n    ");
     }
+    output.extend_from_slice(
+        &patterns.unquoted_field_patterns[0].prefix
+            [..patterns.unquoted_field_patterns[0].prefix_len],
+    );
+    output.extend_from_slice(id_str.as_bytes());
 
-    // Quoted fields (name, industry, city, state, country)
+    // Write revenue
+    output.extend_from_slice(&separator[..if pretty { 6 } else { 1 }]);
+    output.extend_from_slice(
+        &patterns.unquoted_field_patterns[1].prefix
+            [..patterns.unquoted_field_patterns[1].prefix_len],
+    );
+    output.extend_from_slice(revenue_str.as_bytes());
+
+    // Write employees
+    output.extend_from_slice(&separator[..if pretty { 6 } else { 1 }]);
+    output.extend_from_slice(
+        &patterns.unquoted_field_patterns[2].prefix
+            [..patterns.unquoted_field_patterns[2].prefix_len],
+    );
+    output.extend_from_slice(employees_str.as_bytes());
+
+    // Write quoted fields (name, industry, city, state, country)
     let values = [
         &location.name,
         &location.industry,
@@ -363,6 +358,7 @@ fn write_location_json_simd(
         &location.state,
         &location.country,
     ];
+
     for (pattern, value) in patterns.quoted_field_patterns.iter().zip(values.iter()) {
         output.extend_from_slice(&separator[..if pretty { 6 } else { 1 }]);
         output.extend_from_slice(&pattern.prefix[..pattern.prefix_len]);

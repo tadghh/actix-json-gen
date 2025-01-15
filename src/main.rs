@@ -40,30 +40,37 @@ async fn generate_data(
     data_pools: web::Data<Arc<DataPools>>,
 ) -> Result<HttpResponse, Error> {
     const BYTE_SIZE: usize = 1024 * 1024;
-
     let target_size = if let Some(size_str) = params.get("size") {
         parse_size(size_str).unwrap_or(BYTE_SIZE)
     } else {
         BYTE_SIZE
     };
-
     let pretty = params.get("pretty").map_or(false, |v| v == "true");
     let format = OutputFormat::from_str(params.get("format").map_or("json", |s| s));
     let seed: u64 = rand::thread_rng().gen();
-
     let num_threads = num_cpus::get();
     let chunk_size = target_size / num_threads;
 
-    let total_generated = Arc::new(Mutex::new(0usize));
+    // Calculate approximate records per chunk based on average record size
+    let avg_record_size = if format == OutputFormat::JSON {
+        if pretty {
+            250
+        } else {
+            180
+        } // Approximate sizes
+    } else {
+        120 // CSV approximate record size
+    };
+    let records_per_chunk = chunk_size / avg_record_size;
 
     let progress = Arc::new(Mutex::new(ProgressInfo::new(
-        (target_size / (BYTE_SIZE)) as f64,
+        (target_size / BYTE_SIZE) as f64,
     )));
 
     print!("\x1B[2J\x1B[1;1H");
     println!("Starting new data generation request:");
     println!("------------------------------------");
-    println!("Requested size: {:.2}MB", target_size / (BYTE_SIZE));
+    println!("Requested size: {:.2}MB", target_size / BYTE_SIZE);
     println!(
         "Format: {}",
         if format == OutputFormat::JSON {
@@ -84,19 +91,20 @@ async fn generate_data(
         .map(|i| {
             let is_first = i == 0;
             let chunk_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
-            let start_id = *total_generated.lock();
+
+            // Calculate start ID for this chunk based on chunk index
+            let start_id = (i as u32) * records_per_chunk as u32;
 
             let result = generate_chunk(
-                start_id as u32,
+                start_id,
                 chunk_size,
-                &data_pools,
+                &*data_pools,
                 chunk_rng,
                 pretty,
                 is_first,
                 &format,
                 progress.clone(),
             );
-            *total_generated.lock() += result.count;
 
             result
         })
@@ -104,7 +112,6 @@ async fn generate_data(
 
     println!("\nCombining Data.");
     let mut output = Vec::with_capacity(target_size + 1024);
-
     for chunk in chunks {
         output.extend(chunk.data);
     }
