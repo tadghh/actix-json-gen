@@ -1,15 +1,12 @@
 #![feature(get_mut_unchecked, portable_simd)]
 use actix_web::{web, App, Error, HttpResponse, HttpServer};
-
 use parking_lot::Mutex;
 use processing::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
-
 use std::collections::HashMap;
 use std::io::{stdout, Write};
-
 use std::sync::Arc;
 mod processing;
 
@@ -35,34 +32,30 @@ fn parse_size(size_str: &str) -> Result<usize, String> {
     Ok(number * multiplier)
 }
 
+const BYTE_SIZE: usize = 1024 * 1024;
+
 async fn generate_data(
     web::Query(params): web::Query<HashMap<String, String>>,
     data_pools: web::Data<Arc<DataPools>>,
 ) -> Result<HttpResponse, Error> {
-    const BYTE_SIZE: usize = 1024 * 1024;
-    let target_size = if let Some(size_str) = params.get("size") {
-        parse_size(size_str).unwrap_or(BYTE_SIZE)
-    } else {
-        BYTE_SIZE
+    let target_size = match params.get("size") {
+        Some(size) => match parse_size(size) {
+            Ok(size) => size,
+            Err(_) => BYTE_SIZE,
+        },
+        None => BYTE_SIZE,
     };
     let pretty = params.get("pretty").map_or(false, |v| v == "true");
     let format = OutputFormat::from_str(params.get("format").map_or("json", |s| s));
     let seed: u64 = rand::thread_rng().gen();
     let num_threads = num_cpus::get();
     let chunk_size = target_size / num_threads;
-
-    // Calculate approximate records per chunk based on average record size
     let avg_record_size = if format == OutputFormat::JSON {
-        if pretty {
-            250
-        } else {
-            180
-        } // Approximate sizes
+        250
     } else {
-        120 // CSV approximate record size
+        120
     };
     let records_per_chunk = chunk_size / avg_record_size;
-
     let progress = Arc::new(Mutex::new(ProgressInfo::new(
         (target_size / BYTE_SIZE) as f64,
     )));
@@ -79,6 +72,7 @@ async fn generate_data(
             "CSV"
         }
     );
+
     if format == OutputFormat::JSON {
         println!(
             "Pretty print: {}",

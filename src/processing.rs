@@ -1,194 +1,17 @@
-use fake::faker::address::en::*;
-use fake::faker::company::en::*;
-use fake::Fake;
+use crate::ProgressInfo;
+use fake::{
+    faker::{address::en::*, company::en::*},
+    Fake,
+};
 use parking_lot::Mutex;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 use std::{simd::u8x32, sync::Arc};
 
-use crate::ProgressInfo;
-
-#[derive(Serialize)]
-struct BusinessLocation {
-    id: u32,
-    name: String,
-    industry: String,
-    revenue: f32,
-    employees: u32,
-    city: String,
-    state: String,
-    country: String,
-}
-
-// Add an enum to represent output formats
-#[derive(PartialEq)]
-pub enum OutputFormat {
-    JSON,
-    CSV,
-}
-
-impl OutputFormat {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "csv" => OutputFormat::CSV,
-            _ => OutputFormat::JSON,
-        }
-    }
-
-    pub fn content_type(&self) -> &str {
-        match self {
-            OutputFormat::JSON => "application/json",
-            OutputFormat::CSV => "text/csv",
-        }
-    }
-}
-
-pub struct DataPools {
-    names: Vec<String>,
-    industries: Vec<String>,
-    cities: Vec<String>,
-    states: Vec<String>,
-    countries: Vec<String>,
-}
-
-pub struct ChunkResult {
-    pub data: Vec<u8>,
-}
-
-impl DataPools {
-    pub fn new() -> Self {
-        let pool_size = 1000;
-        DataPools {
-            names: (0..pool_size).map(|_| CompanyName().fake()).collect(),
-            industries: (0..pool_size).map(|_| Industry().fake()).collect(),
-            cities: (0..pool_size).map(|_| CityName().fake()).collect(),
-            states: (0..pool_size).map(|_| StateName().fake()).collect(),
-            countries: (0..50).map(|_| CountryName().fake()).collect(),
-        }
-    }
-}
-
-#[inline]
-pub fn generate_chunk(
-    start_id: u32,
-    target_chunk_size: usize,
-    pools: &DataPools,
-    mut rng: ChaCha8Rng,
-    pretty: bool,
-    is_first: bool,
-    format: &OutputFormat,
-    mut progress: Arc<Mutex<ProgressInfo>>,
-) -> ChunkResult {
-    let mut output = Vec::with_capacity(target_chunk_size + 1024);
-    let json_patterns = JsonPatterns::new();
-    if is_first && *format == OutputFormat::CSV {
-        output.extend_from_slice(b"id,name,industry,revenue,employees,city,state,country\n");
-    } else if is_first && *format == OutputFormat::JSON {
-        output.extend_from_slice(if pretty { b"[\n  " } else { b"[" });
-    }
-
-    let mut current_id = start_id;
-    let mut is_start = is_first;
-
-    while output.len() < target_chunk_size {
-        let random_number = rng.gen_range(0..100);
-        let location = BusinessLocation {
-            id: current_id,
-            name: pools.names[random_number].clone(),
-            industry: pools.industries[random_number].clone().replace(",", ""),
-            revenue: rng.gen_range(100000.0..100000000.0),
-            employees: rng.gen_range(10..10000),
-            city: pools.cities[random_number].clone(),
-            state: pools.states[random_number].clone(),
-            country: pools.countries[rng.gen_range(0..5)].clone(),
-        };
-
-        match format {
-            OutputFormat::JSON => {
-                write_location_json_simd(&location, &mut output, pretty, &json_patterns, is_start);
-            }
-            OutputFormat::CSV => {
-                write_location_csv_simd(&location, &mut output);
-            }
-        }
-
-        current_id += 1;
-        is_start = false;
-
-        unsafe {
-            let progress_locked = Arc::get_mut_unchecked(&mut progress);
-            progress_locked.force_unlock();
-            progress_locked.get_mut().update(output.len());
-        }
-
-        if current_id % 1500 == 0 {
-            progress.lock().print_progress();
-        }
-    }
-
-    ChunkResult { data: output }
-}
-
-#[inline]
-fn write_location_csv_simd(location: &BusinessLocation, output: &mut Vec<u8>) {
-    // Pre-convert numbers to strings to know exact sizes
-    let id_str = location.id.to_string();
-    let revenue_str = location.revenue.to_string();
-    let employees_str = location.employees.to_string();
-
-    // Calculate total size needed
-    let total_size = id_str.len()
-        + location.name.len()
-        + location.industry.len()
-        + revenue_str.len()
-        + employees_str.len()
-        + location.city.len()
-        + location.state.len()
-        + location.country.len()
-        + 8; // 8 commas/newline
-
-    // Ensure capacity
-    output.reserve(total_size);
-
-    // Write fields with SIMD
-    copy_str_simd(output, &id_str);
-    output.push(b',');
-    copy_str_simd(output, &location.name);
-    output.push(b',');
-    copy_str_simd(output, &location.industry);
-    output.push(b',');
-    copy_str_simd(output, &revenue_str);
-    output.push(b',');
-    copy_str_simd(output, &employees_str);
-    output.push(b',');
-    copy_str_simd(output, &location.city);
-    output.push(b',');
-    copy_str_simd(output, &location.state);
-    output.push(b',');
-    copy_str_simd(output, &location.country);
-    output.push(b'\n');
-}
-
-#[inline]
-fn copy_str_simd(output: &mut Vec<u8>, s: &str) {
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let chunks = len / 32;
-
-    // Process 32 bytes at a time using SIMD
-    for chunk in 0..chunks {
-        let offset = chunk * 32;
-        let simd_chunk = u8x32::from_slice(&bytes[offset..offset + 32]);
-        output.extend_from_slice(&simd_chunk.to_array());
-    }
-
-    // Handle remaining bytes
-    let remaining_start = chunks * 32;
-    if remaining_start < len {
-        output.extend_from_slice(&bytes[remaining_start..]);
-    }
-}
+const BYTE_COUNT: usize = 32;
+const REFRESH_COUNT: u32 = 1500;
+const POOL_SIZE: i32 = 1000;
 
 // Pre-computed patterns for both pretty and compact modes
 struct JsonPatterns {
@@ -257,6 +80,184 @@ impl JsonPatterns {
             quoted_field_patterns: quoted_fields,
             unquoted_field_patterns: unquoted_fields,
         }
+    }
+}
+
+#[derive(Serialize)]
+struct BusinessLocation {
+    id: u32,
+    name: String,
+    industry: String,
+    revenue: f32,
+    employees: u32,
+    city: String,
+    state: String,
+    country: String,
+}
+
+#[derive(PartialEq)]
+pub enum OutputFormat {
+    JSON,
+    CSV,
+}
+
+impl OutputFormat {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "csv" => OutputFormat::CSV,
+            _ => OutputFormat::JSON,
+        }
+    }
+
+    pub fn content_type(&self) -> &str {
+        match self {
+            OutputFormat::JSON => "application/json",
+            OutputFormat::CSV => "text/csv",
+        }
+    }
+}
+
+pub struct DataPools {
+    names: Vec<String>,
+    industries: Vec<String>,
+    cities: Vec<String>,
+    states: Vec<String>,
+    countries: Vec<String>,
+}
+
+pub struct ChunkResult {
+    pub data: Vec<u8>,
+}
+
+impl DataPools {
+    pub fn new() -> Self {
+        DataPools {
+            names: (0..POOL_SIZE).map(|_| CompanyName().fake()).collect(),
+            industries: (0..POOL_SIZE).map(|_| Industry().fake()).collect(),
+            cities: (0..POOL_SIZE).map(|_| CityName().fake()).collect(),
+            states: (0..POOL_SIZE).map(|_| StateName().fake()).collect(),
+            countries: (0..50).map(|_| CountryName().fake()).collect(),
+        }
+    }
+}
+
+#[inline]
+pub fn generate_chunk(
+    start_id: u32,
+    target_chunk_size: usize,
+    pools: &DataPools,
+    mut rng: ChaCha8Rng,
+    pretty: bool,
+    is_first: bool,
+    format: &OutputFormat,
+    mut progress: Arc<Mutex<ProgressInfo>>,
+) -> ChunkResult {
+    let mut output = Vec::with_capacity(target_chunk_size + 1024);
+    let json_patterns = JsonPatterns::new();
+    if is_first && *format == OutputFormat::CSV {
+        output.extend_from_slice(b"id,name,industry,revenue,employees,city,state,country\n");
+    } else if is_first && *format == OutputFormat::JSON {
+        output.extend_from_slice(if pretty { b"[\n  " } else { b"[" });
+    }
+
+    let mut current_id = start_id;
+    let mut is_start = is_first;
+
+    while output.len() < target_chunk_size {
+        let random_number = rng.gen_range(0..100);
+        let location = BusinessLocation {
+            id: current_id,
+            name: pools.names[random_number].clone(),
+            industry: pools.industries[random_number].clone().replace(",", ""),
+            revenue: rng.gen_range(100000.0..100000000.0),
+            employees: rng.gen_range(10..10000),
+            city: pools.cities[random_number].clone(),
+            state: pools.states[random_number].clone(),
+            country: pools.countries[rng.gen_range(0..5)].clone(),
+        };
+
+        match format {
+            OutputFormat::JSON => {
+                write_location_json_simd(&location, &mut output, pretty, &json_patterns, is_start);
+            }
+            OutputFormat::CSV => {
+                write_location_csv_simd(&location, &mut output);
+            }
+        }
+
+        current_id += 1;
+        is_start = false;
+
+        unsafe {
+            let progress_locked = Arc::get_mut_unchecked(&mut progress);
+            progress_locked.force_unlock();
+            progress_locked.get_mut().update(output.len());
+        }
+
+        if current_id % REFRESH_COUNT == 0 {
+            progress.lock().print_progress();
+        }
+    }
+
+    ChunkResult { data: output }
+}
+
+#[inline]
+fn write_location_csv_simd(location: &BusinessLocation, output: &mut Vec<u8>) {
+    // Pre-convert numbers to strings to know exact sizes
+    let id_str = location.id.to_string();
+    let revenue_str = location.revenue.to_string();
+    let employees_str = location.employees.to_string();
+
+    // Calculate total size needed
+    let total_size = id_str.len()
+        + location.name.len()
+        + location.industry.len()
+        + revenue_str.len()
+        + employees_str.len()
+        + location.city.len()
+        + location.state.len()
+        + location.country.len()
+        + 8; // 8 commas/newline
+
+    // Ensure capacity
+    output.reserve(total_size);
+
+    // Write fields with SIMD
+    copy_str_simd(output, &id_str);
+    output.push(b',');
+    copy_str_simd(output, &location.name);
+    output.push(b',');
+    copy_str_simd(output, &location.industry);
+    output.push(b',');
+    copy_str_simd(output, &revenue_str);
+    output.push(b',');
+    copy_str_simd(output, &employees_str);
+    output.push(b',');
+    copy_str_simd(output, &location.city);
+    output.push(b',');
+    copy_str_simd(output, &location.state);
+    output.push(b',');
+    copy_str_simd(output, &location.country);
+    output.push(b'\n');
+}
+
+#[inline]
+fn copy_str_simd(output: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let chunks = len / BYTE_COUNT;
+
+    // Process 32 bytes at a time using SIMD
+    for chunk in 0..chunks {
+        let offset = chunk * BYTE_COUNT;
+        let simd_chunk = u8x32::from_slice(&bytes[offset..offset + BYTE_COUNT]);
+        output.extend_from_slice(&simd_chunk.to_array());
+    }
+
+    let remaining_start = chunks * BYTE_COUNT;
+    if remaining_start < len {
+        output.extend_from_slice(&bytes[remaining_start..]);
     }
 }
 
