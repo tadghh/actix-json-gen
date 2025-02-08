@@ -1,14 +1,41 @@
-#![feature(get_mut_unchecked, portable_simd)]
-use actix_web::{web, App, Error, HttpResponse, HttpServer};
-use parking_lot::Mutex;
+#![feature(portable_simd)]
+use actix_web::web::Bytes;
+use actix_web::{web, App, HttpResponse, HttpServer};
+use core::fmt::Error;
 use processing::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use rayon::prelude::*;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::collections::HashMap;
-use std::io::{stdout, Write};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-mod processing;
+use tokio::sync::mpsc::channel;
+use tokio_stream::wrappers::ReceiverStream;
+use util::ProgressInfo;
+
+pub mod processing;
+pub mod util;
+
+const BYTE_SIZE: usize = 1024 * 1024;
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let num_cpus = num_cpus::get();
+    println!("Starting server at http://127.0.0.1:8080");
+    println!("Using {} Cores for generation", num_cpus);
+
+    let data_pools = Arc::new(DataPools::new());
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::new(data_pools.clone()))
+            .route("/generate", web::get().to(generate_data))
+    })
+    .bind("127.0.0.1:8080")?
+    .workers(num_cpus)
+    .run()
+    .await
+}
 
 fn parse_size(size_str: &str) -> Result<usize, String> {
     let size_str = size_str.to_lowercase();
@@ -32,12 +59,13 @@ fn parse_size(size_str: &str) -> Result<usize, String> {
     Ok(number * multiplier)
 }
 
-const BYTE_SIZE: usize = 1024 * 1024;
-
 async fn generate_data(
     web::Query(params): web::Query<HashMap<String, String>>,
     data_pools: web::Data<Arc<DataPools>>,
-) -> Result<HttpResponse, Error> {
+) -> Result<HttpResponse, actix_web::Error> {
+    let seed: u64 = rand::thread_rng().gen();
+
+    let num_threads = num_cpus::get();
     let target_size = match params.get("size") {
         Some(size) => match parse_size(size) {
             Ok(size) => size,
@@ -45,160 +73,89 @@ async fn generate_data(
         },
         None => BYTE_SIZE,
     };
-    let pretty = params.get("pretty").map_or(false, |v| v == "true");
-    let format = OutputFormat::from_str(params.get("format").map_or("json", |s| s));
-    let seed: u64 = rand::thread_rng().gen();
-    let num_threads = num_cpus::get();
     let chunk_size = target_size / num_threads;
-    let avg_record_size = if format == OutputFormat::JSON {
-        250
-    } else {
-        120
-    };
-    let records_per_chunk = chunk_size / avg_record_size;
-    let progress = Arc::new(Mutex::new(ProgressInfo::new(
-        (target_size / BYTE_SIZE) as f64,
-    )));
+
+    let pretty_print = params.get("pretty").map_or(false, |v| v == "true");
+    let stream_content_type = OutputFormat::from_str(params.get("format").map_or("json", |s| s));
+
+    // Create channels for streaming data
+    let (tx, rx) = channel::<Result<Bytes, Error>>(8);
+    let (chunk_tx, chunk_rx) = std_mpsc::channel();
+    let progress = Arc::new(ProgressInfo::new((target_size / BYTE_SIZE) as f64));
 
     print!("\x1B[2J\x1B[1;1H");
-    println!("Starting new data generation request:");
+    println!("Starting new streaming data generation request:");
     println!("------------------------------------");
     println!("Requested size: {:.2}MB", target_size / BYTE_SIZE);
     println!(
         "Format: {}",
-        if format == OutputFormat::JSON {
+        if stream_content_type == OutputFormat::JSON {
             "JSON"
         } else {
             "CSV"
         }
     );
 
-    if format == OutputFormat::JSON {
-        println!(
-            "Pretty print: {}",
-            params.get("pretty").map_or("false", |v| v)
-        );
-    }
+    let data_pools_clone = data_pools.clone();
+    let other_prog = progress.clone();
 
-    let chunks: Vec<ChunkResult> = (0..num_threads)
-        .into_par_iter()
-        .map(|i| {
-            let is_first = i == 0;
-            let chunk_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
+    tokio::spawn(async move {
+        if stream_content_type == OutputFormat::CSV {
+            let header = b"id,name,industry,revenue,employees,city,state,country\n";
+            tx.send(Ok(Bytes::from(header.to_vec()))).await.ok();
+        } else {
+            tx.send(Ok(Bytes::from(
+                if pretty_print { b"[\n" } else { b"[ " }.to_vec(),
+            )))
+            .await
+            .ok();
+        }
 
-            // Calculate start ID for this chunk based on chunk index
-            let start_id = (i as u32) * records_per_chunk as u32;
+        std::thread::spawn(move || {
+            (0..num_threads).into_par_iter().for_each(|i| {
+                let chunk_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
+                let start_id = (i as u32) * (chunk_size as u32);
 
-            let result = generate_chunk(
-                start_id,
-                chunk_size,
-                &*data_pools,
-                chunk_rng,
-                pretty,
-                is_first,
-                &format,
-                progress.clone(),
-            );
+                let mut generator = StreamGenerator::new(
+                    start_id,
+                    chunk_rng,
+                    data_pools_clone.clone(),
+                    pretty_print,
+                    stream_content_type,
+                    i == 0,
+                    other_prog.clone(),
+                    chunk_size,
+                );
 
-            result
-        })
-        .collect();
+                while let Some(chunk) = generator.generate_chunk() {
+                    other_prog.print_progress();
+                    if chunk_tx.send(chunk).is_err() {
+                        break;
+                    }
+                }
+            });
+        });
 
-    println!("\nCombining Data.");
-    let mut output = Vec::with_capacity(target_size + 1024);
-    for chunk in chunks {
-        output.extend(chunk.data);
-    }
+        for chunk in chunk_rx {
+            if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
+                break;
+            }
+        }
 
-    if format == OutputFormat::JSON {
-        output.extend_from_slice(if pretty { b"\n]\n" } else { b"]" });
-    }
+        if stream_content_type == OutputFormat::JSON {
+            tx.send(Ok(Bytes::from(
+                if pretty_print { b"\n]\n" } else { b"  ]" }.to_vec(),
+            )))
+            .await
+            .ok();
+        }
+    });
 
-    println!("Done.");
-    progress.lock().print_progress();
+    progress.clone().print_progress();
+
+    let stream = ReceiverStream::new(rx);
 
     Ok(HttpResponse::Ok()
-        .insert_header(("Content-Type", format.content_type()))
-        .body(output))
-}
-
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    println!("Starting server at http://127.0.0.1:8080");
-    println!("Using {} CPU cores for data generation", num_cpus::get());
-
-    let data_pools = Arc::new(DataPools::new());
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(data_pools.clone()))
-            .route("/generate", web::get().to(generate_data))
-    })
-    .bind("127.0.0.1:8080")?
-    .workers(num_cpus::get())
-    .run()
-    .await
-}
-struct ProgressInfo {
-    current_size: f64,
-    target_size: f64,
-    last_printed: std::time::Instant,
-}
-
-impl ProgressInfo {
-    const SIZES: f64 = 1024.0 * 1024.0;
-    fn new(target_size: f64) -> Self {
-        Self {
-            current_size: 0.0,
-            target_size,
-            last_printed: std::time::Instant::now(),
-        }
-    }
-
-    fn update(&mut self, chunk_size: usize) {
-        let new_size =
-            ((self.current_size + chunk_size as f64) / Self::SIZES) * num_cpus::get() as f64;
-
-        // Make sure we dont regress 😩
-        if self.current_size < new_size {
-            self.current_size = new_size;
-        }
-    }
-
-    fn print_progress(&mut self) {
-        let now = std::time::Instant::now();
-        if now.duration_since(self.last_printed).as_millis() < 50 {
-            return;
-        }
-        self.last_printed = now;
-
-        let percentage = self.current_size / self.target_size;
-        let bar_width = 50.0;
-
-        let filled = (percentage * bar_width).round() as usize;
-        let remaining = (bar_width - filled as f64).round() as usize;
-
-        // Move cursor to line 6 (after the headers)
-        print!("\x1B[6;1H");
-
-        // Clear line and move to start
-        print!("\r\x1B[K");
-
-        let current_mb = self.current_size;
-        let target_mb = self.target_size;
-
-        print!(
-            "Generating data: [{}{}] {:.2}MB/{:.2}MB ({:.2}%)",
-            "=".repeat(filled),
-            ".".repeat(remaining),
-            current_mb,
-            target_mb,
-            percentage * 100.0
-        );
-        stdout().flush().unwrap();
-
-        if self.current_size >= self.target_size {
-            println!("\nGeneration complete!");
-        }
-    }
+        .insert_header(("Content-Type", stream_content_type.content_type()))
+        .streaming(stream))
 }
