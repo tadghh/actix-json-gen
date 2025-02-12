@@ -4,12 +4,9 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::sync::Arc;
 
-use json_gen_actix::{
-    processing::{
-        write_location_csv_simd, write_location_json_simd, BusinessLocation, DataPools,
-        JsonPatterns, OutputFormat, StreamGenerator,
-    },
-    util::ProgressInfo,
+use json_gen_actix::processing::{
+    write_location_csv_simd, write_location_json_simd, BusinessLocation, DataPools, JsonPatterns,
+    OutputFormat, StreamGenerator,
 };
 
 fn bench_formats(c: &mut Criterion) {
@@ -26,8 +23,6 @@ fn bench_formats(c: &mut Criterion) {
                     data_pools.clone(),
                     true,
                     OutputFormat::JSON,
-                    true,
-                    Arc::new(ProgressInfo::new(1.0)),
                     size * 1024,
                 );
                 generator.generate_chunk()
@@ -42,8 +37,6 @@ fn bench_formats(c: &mut Criterion) {
                     data_pools.clone(),
                     false,
                     OutputFormat::JSON,
-                    true,
-                    Arc::new(ProgressInfo::new(1.0)),
                     size * 1024,
                 );
                 generator.generate_chunk()
@@ -58,8 +51,6 @@ fn bench_formats(c: &mut Criterion) {
                     data_pools.clone(),
                     false,
                     OutputFormat::CSV,
-                    true,
-                    Arc::new(ProgressInfo::new(1.0)),
                     size * 1024,
                 );
                 generator.generate_chunk()
@@ -85,7 +76,7 @@ fn bench_simd_operations(c: &mut Criterion) {
     group.bench_function("json_simd_write", |b| {
         b.iter(|| {
             let mut output = Vec::with_capacity(1024);
-            write_location_json_simd(&location, &mut output, true, &JsonPatterns::new(), true);
+            write_location_json_simd(&location, &mut output, true, &JsonPatterns::new());
         })
     });
 

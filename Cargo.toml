@@ -5,6 +5,7 @@ version="0.1.1"
 
 [dependencies]
 actix-web   ={ version="4.9.0", default-features=false, features=["macros"] }
+crossterm = "0.28.1"
 dtoa        ="1.0.9"
 fake        ={ version="3.1.0", default-features=false, features=["derive"] }
 itoa        ="1.0.14"

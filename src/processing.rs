@@ -1,4 +1,3 @@
-use crate::util::ProgressInfo;
 #[cfg(target_arch = "x86_64")]
 use actix_web::web;
 use fake::{
@@ -116,7 +115,7 @@ struct AlignedPatterns {
 }
 #[derive(Serialize)]
 pub struct BusinessLocation {
-    pub id: u32,
+    pub id: u64,
     pub name: String,
     pub industry: String,
     pub revenue: f32,
@@ -228,13 +227,11 @@ pub fn write_location_json_simd(
     output: &mut Vec<u8>,
     pretty: bool,
     patterns: &JsonPatterns,
-    is_first: bool,
 ) {
-    if !is_first {
+    if pretty {
+        output.extend_from_slice(b",\n  ");
+    } else {
         output.push(b',');
-        if pretty {
-            output.extend_from_slice(b",\n  ");
-        }
     }
 
     let mut id_buf = itoa::Buffer::new();
@@ -316,28 +313,24 @@ pub fn write_location_json_simd(
 }
 
 pub struct StreamGenerator {
-    current_id: u32,
+    current_id: u64,
     rng: ChaCha8Rng,
     pools: web::Data<Arc<DataPools>>,
     pretty: bool,
     format: OutputFormat,
-    is_first: bool,
-    progress: Arc<ProgressInfo>,
     json_patterns: JsonPatterns,
-    bytes_generated: usize,
-    target_size: usize,
+    bytes_generated: u64,
+    target_size: u64,
 }
 
 impl StreamGenerator {
     pub fn new(
-        start_id: u32,
+        start_id: u64,
         rng: ChaCha8Rng,
         pools: web::Data<Arc<DataPools>>,
         pretty: bool,
         format: OutputFormat,
-        is_first: bool,
-        progress: Arc<ProgressInfo>,
-        target_size: usize,
+        target_size: u64,
     ) -> Self {
         Self {
             current_id: start_id,
@@ -345,8 +338,6 @@ impl StreamGenerator {
             pools,
             pretty,
             format,
-            is_first,
-            progress,
             json_patterns: JsonPatterns::new(),
             bytes_generated: 0,
             target_size,
@@ -358,16 +349,12 @@ impl StreamGenerator {
         if self.bytes_generated >= self.target_size {
             return None;
         }
+        let chunk_target = (1024 * 1024).min(self.target_size - self.bytes_generated);
 
-        let mut output = Vec::with_capacity(262144);
-        let chunk_target = 262144.min(self.target_size - self.bytes_generated);
+        let mut output = Vec::with_capacity(chunk_target.try_into().unwrap());
         let mut records_in_chunk = 0;
-        let mut current_write = 0;
 
-        if records_in_chunk > 0 {
-            self.is_first = false;
-        }
-        while output.len() < chunk_target && records_in_chunk < 1000 {
+        while output.len() < chunk_target as usize && records_in_chunk < 1000 {
             let random_number = self.rng.gen_range(0..100);
             let location = BusinessLocation {
                 id: self.current_id,
@@ -393,7 +380,6 @@ impl StreamGenerator {
                         &mut output,
                         self.pretty,
                         &self.json_patterns,
-                        self.is_first,
                     );
                 }
                 OutputFormat::CSV => {
@@ -405,17 +391,8 @@ impl StreamGenerator {
             records_in_chunk += 1;
 
             let bytes_written = output.len() - start_len;
-            self.bytes_generated += bytes_written;
-            current_write += bytes_written;
-
-            if bytes_written % 60 == 0 {
-                self.progress.update(current_write);
-                self.progress.print_progress();
-                current_write = 0;
-            }
+            self.bytes_generated += bytes_written as u64;
         }
-
-        self.progress.update(current_write);
 
         if !output.is_empty() {
             Some(output)
