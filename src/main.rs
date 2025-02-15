@@ -2,6 +2,7 @@
 use actix_web::web::Bytes;
 use actix_web::{web, App, HttpResponse, HttpServer};
 use core::fmt::Error;
+
 use processing::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -11,12 +12,11 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use tokio::sync::mpsc::channel;
 use tokio_stream::wrappers::ReceiverStream;
-use util::ProgressInfo;
+
+use util::{convert_error, get_size_info, ProgressInfo};
 
 pub mod processing;
 pub mod util;
-
-const BYTE_SIZE: usize = 1024 * 1024;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -36,96 +36,29 @@ async fn main() -> std::io::Result<()> {
     .run()
     .await
 }
-fn parse_size(size_str: &str) -> Result<u64, String> {
-    let size_str = size_str.to_lowercase();
-    let (number_str, unit) = size_str
-        .find(|c: char| !c.is_digit(10))
-        .map(|i| size_str.split_at(i))
-        .ok_or_else(|| "Invalid format".to_string())?;
-
-    let number: u64 = number_str
-        .parse()
-        .map_err(|_| "Invalid number".to_string())?;
-
-    let multiplier = match unit {
-        "b" => 1,
-        "kb" => 1024,
-        "mb" => 1024 * 1024,
-        "gb" => 1024 * 1024 * 1024,
-        _ => return Err("Invalid unit".to_string()),
-    };
-
-    Ok(number * multiplier)
-}
-fn parse_divisor(size_str: &str) -> Result<u64, String> {
-    let size_str = size_str.to_lowercase();
-    let (_, unit) = size_str
-        .find(|c: char| !c.is_digit(10))
-        .map(|i| size_str.split_at(i))
-        .ok_or_else(|| "Invalid format".to_string())?;
-
-    let multiplier = match unit {
-        "b" => 1,
-        "kb" => 1024,
-        "mb" => 1024 * 1024,
-        "gb" => 1024 * 1024 * 1024,
-        _ => return Err("Invalid unit".to_string()),
-    };
-
-    Ok(multiplier)
-}
 
 async fn generate_data(
     web::Query(params): web::Query<HashMap<String, String>>,
     data_pools: web::Data<Arc<DataPools>>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let seed: u64 = rand::thread_rng().gen();
-    let num_threads = num_cpus::get();
-    let mut size_type = "";
-
     let stream_content_type = OutputFormat::from_str(params.get("format").map_or("json", |s| s));
     let pretty_print = params.get("pretty").map_or(false, |v| v == "true");
 
-    let target_size: u64 = match params.get("size") {
-        Some(size_str) => match parse_size(size_str) {
-            Ok(size) => {
-                size_type = size_str.split_at(size_str.len() - 2).1;
-
-                size as u64
-            }
-            Err(_) => BYTE_SIZE as u64,
-        },
-        None => BYTE_SIZE as u64,
-    };
-
-    let divisor: u64 = match params.get("size") {
-        Some(size_str) => match parse_divisor(size_str) {
-            Ok(size) => size as u64,
-            Err(_) => 0 as u64,
-        },
-        None => 0 as u64,
-    };
-
-    print!("\x1B[2J\x1B[1;1H");
-    println!("Starting new streaming data generation request:");
-    println!("------------------------------------");
-    println!("Requested size: {}{size_type}", target_size / divisor);
-    println!(
-        "Format: {}",
-        if stream_content_type == OutputFormat::JSON {
-            "JSON"
-        } else {
-            "CSV"
-        }
-    );
-
-    let (tx, rx) = channel::<Result<Bytes, Error>>(32);
+    let size_info = get_size_info(params.get("size")).map_err(convert_error)?;
+    let (tx, rx) = channel::<Result<Bytes, Error>>(512);
     let (chunk_tx, chunk_rx) = std_mpsc::channel();
 
-    let progress = Arc::new(ProgressInfo::new(target_size.try_into().unwrap()));
+    let progress = Arc::new(ProgressInfo::new(
+        size_info.total_size,
+        size_info.multiplier,
+        size_info.unit,
+    ));
+    progress.print_header(stream_content_type);
 
     tokio::spawn(async move {
-        let chunk_size = target_size / (num_threads as u64);
+        let seed: u64 = rand::thread_rng().gen();
+        let num_threads = num_cpus::get();
+        let chunk_size = size_info.total_size / (num_threads as u64);
         let other_prog = progress.clone();
 
         if stream_content_type == OutputFormat::CSV {
@@ -141,12 +74,12 @@ async fn generate_data(
             .ok();
 
             let chunk_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1 as u64));
-            let start_id = (1 as u64) * (chunk_size);
+            let start_id = 1 as u64;
 
             let mut generator = StreamGenerator::new(
                 start_id,
                 chunk_rng,
-                data_pools.clone(),
+                &data_pools,
                 pretty_print,
                 stream_content_type,
                 chunk_size,
@@ -163,14 +96,16 @@ async fn generate_data(
         }
 
         std::thread::spawn(move || {
-            (0..num_threads).into_par_iter().for_each(|i| {
+            let data_pools = DataPools::new();
+
+            (1..num_threads).into_par_iter().for_each(|i| {
                 let chunk_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
-                let start_id = ((i - 1) as u64) * (chunk_size);
+                let start_id = ((i) as u64) * (chunk_size);
 
                 let mut generator = StreamGenerator::new(
                     start_id,
                     chunk_rng,
-                    data_pools.clone(),
+                    &data_pools,
                     pretty_print,
                     stream_content_type,
                     chunk_size,
@@ -188,9 +123,7 @@ async fn generate_data(
         });
 
         for chunk in chunk_rx {
-            let chunk_size = chunk.len();
-            progress.print_progress();
-            progress.update_streamed(chunk_size);
+            progress.update_streamed(chunk.len());
             progress.print_progress();
             if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                 break;
@@ -198,14 +131,14 @@ async fn generate_data(
         }
 
         if stream_content_type == OutputFormat::JSON {
-            progress.print_progress();
-
+            progress.update_streamed(chunk_size.try_into().unwrap());
             tx.send(Ok(Bytes::from(
                 if pretty_print { b"\n]\n" } else { b"  ]" }.to_vec(),
             )))
             .await
             .ok();
         }
+
         progress.print_progress();
     });
 
