@@ -24,29 +24,21 @@ async fn main() -> std::io::Result<()> {
     println!("Starting server at http://127.0.0.1:8080");
     println!("Using {} Cores for generation", num_cpus);
 
-    let data_pools = Arc::new(DataPools::new());
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(data_pools.clone()))
-            .route("/generate", web::get().to(generate_data))
-    })
-    .bind("127.0.0.1:8080")?
-    .workers(num_cpus)
-    .run()
-    .await
+    HttpServer::new(move || App::new().route("/generate", web::get().to(generate_data)))
+        .bind("127.0.0.1:8080")?
+        .workers(num_cpus)
+        .run()
+        .await
 }
 
 async fn generate_data(
     web::Query(params): web::Query<HashMap<String, String>>,
-    data_pools: web::Data<Arc<DataPools>>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let stream_content_type = OutputFormat::from_str(params.get("format").map_or("json", |s| s));
     let pretty_print = params.get("pretty").map_or(false, |v| v == "true");
 
     let size_info = get_size_info(params.get("size")).map_err(convert_error)?;
-    let (tx, rx) = channel::<Result<Bytes, Error>>(512);
-    let (chunk_tx, chunk_rx) = std_mpsc::channel();
+    let (tx, rx) = channel::<Result<Bytes, Error>>(16);
 
     let progress = Arc::new(ProgressInfo::new(
         size_info.total_size,
@@ -60,45 +52,21 @@ async fn generate_data(
         let num_threads = num_cpus::get();
         let chunk_size = size_info.total_size / (num_threads as u64);
         let other_prog = progress.clone();
-
+        let (chunk_tx, chunk_rx) = std_mpsc::sync_channel(16);
         if stream_content_type == OutputFormat::CSV {
             let header = b"id,name,industry,revenue,employees,city,state,country\n";
             progress.update_streamed(header.len());
 
             tx.send(Ok(Bytes::from(header.to_vec()))).await.ok();
         } else {
-            tx.send(Ok(Bytes::from(
-                if pretty_print { b"[\n" } else { b"[ " }.to_vec(),
-            )))
-            .await
-            .ok();
-
-            let chunk_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1 as u64));
-            let start_id = 1 as u64;
-
-            let mut generator = StreamGenerator::new(
-                start_id,
-                chunk_rng,
-                &data_pools,
-                pretty_print,
-                stream_content_type,
-                chunk_size,
-            );
-
-            while let Some(chunk) = generator.generate_chunk() {
-                progress.update(chunk.len());
-                progress.print_progress();
-
-                if chunk_tx.send(chunk).is_err() {
-                    break;
-                }
-            }
+            tx.send(Ok(Bytes::from(b"[ ".to_vec()))).await.ok();
         }
 
+        if chunk_tx.send(b"[ ".to_vec()).is_err() {}
         std::thread::spawn(move || {
             let data_pools = DataPools::new();
 
-            (1..num_threads).into_par_iter().for_each(|i| {
+            (0..num_threads).into_par_iter().for_each(|i| {
                 let chunk_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
                 let start_id = ((i) as u64) * (chunk_size);
 
