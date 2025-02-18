@@ -1,3 +1,4 @@
+use bytes::{BufMut, Bytes, BytesMut};
 #[cfg(target_arch = "x86_64")]
 use fake::{
     faker::{address::en::*, company::en::*},
@@ -7,14 +8,24 @@ use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::Serialize;
-use std::{arch::x86_64::*, simd::u8x32};
+use std::simd::u8x32;
 
 const BYTE_COUNT: usize = 32;
 const POOL_SIZE: i32 = 1000;
 const OPTIMAL_CHUNK_SIZE: u64 = 16 * 1024;
 const MAX_RECORDS_PER_CHUNK: u64 = 1000;
-const BUFFER_CAPACITY: usize = 16 * 1024;
 
+// Reference-based version of BusinessLocation to avoid allocations
+pub struct BusinessLocationRef<'a> {
+    id: u64,
+    name: &'a str,
+    industry: &'a str,
+    revenue: f32,
+    employees: u32,
+    city: &'a str,
+    state: &'a str,
+    country: &'a str,
+}
 pub struct StreamGenerator<'a> {
     current_id: u64,
     rng: ChaCha8Rng,
@@ -46,9 +57,8 @@ impl<'a> StreamGenerator<'a> {
             chunk_size,
         }
     }
-
     #[inline]
-    pub fn generate_chunk(&mut self) -> Option<Vec<u8>> {
+    pub fn generate_chunk(&mut self) -> Option<Bytes> {
         if self.bytes_generated >= self.chunk_size {
             return None;
         }
@@ -65,41 +75,33 @@ impl<'a> StreamGenerator<'a> {
 
                 let random_number = local_rng.gen_range(0..100);
 
-                BusinessLocation {
+                BusinessLocationRef {
                     id: start_id + offset,
-                    name: self.pools.names[random_number].to_owned(),
-                    industry: self.pools.industries[random_number]
-                        .to_owned()
-                        .replace(",", ""),
+                    name: &self.pools.names[random_number],
+                    industry: &self.pools.industries[random_number],
                     revenue: local_rng.gen_range(100000.0..100000000.0),
                     employees: local_rng.gen_range(10..10000),
-                    city: self.pools.cities[random_number].to_owned(),
-                    state: self.pools.states[random_number].to_owned(),
-                    country: self.pools.countries[local_rng.gen_range(0..5)].to_owned(),
+                    city: &self.pools.cities[random_number],
+                    state: &self.pools.states[random_number],
+                    country: &self.pools.countries[local_rng.gen_range(0..5)],
                 }
             })
             .collect();
 
-        let estimated_size = match self.format {
-            OutputFormat::JSON => locations.len() * 200,
-            OutputFormat::CSV => locations.len() * 100,
-        };
-
-        let mut output = Vec::with_capacity(estimated_size);
-
-        for location in &locations {
-            let start_len = output.len();
+        let mut buffer = BytesMut::with_capacity(OPTIMAL_CHUNK_SIZE as usize);
+        for location in locations {
+            let start_len = buffer.len();
 
             match self.format {
                 OutputFormat::JSON => {
-                    self.write_location_json_simd(&location, &mut output);
+                    self.write_location_json_simd(&location, &mut buffer);
                 }
                 OutputFormat::CSV => {
-                    self.write_location_csv_simd(&location, &mut output);
+                    self.write_location_csv_simd(&location, &mut buffer);
                 }
             }
 
-            let bytes_written = output.len() - start_len;
+            let bytes_written = buffer.len() - start_len;
             self.bytes_generated += bytes_written as u64;
 
             if self.bytes_generated >= self.chunk_size {
@@ -107,14 +109,76 @@ impl<'a> StreamGenerator<'a> {
             }
         }
 
-        self.current_id += locations.len() as u64;
+        self.current_id += 1;
 
-        if !output.is_empty() {
-            Some(output)
+        if !buffer.is_empty() {
+            Some(buffer.into())
         } else {
             None
         }
     }
+    // #[inline]
+    // pub fn generate_chunk(&mut self) -> Option<Bytes> {
+    //     if self.bytes_generated >= self.chunk_size {
+    //         return None;
+    //     }
+
+    //     let chunk_target = (OPTIMAL_CHUNK_SIZE).min(self.chunk_size - self.bytes_generated);
+    //     let max_records = (chunk_target / 100).min(MAX_RECORDS_PER_CHUNK);
+    //     let start_id = self.current_id;
+
+    //     // Pre-allocate a fixed buffer for the chunk
+    //     let mut buffer = BytesMut::with_capacity(OPTIMAL_CHUNK_SIZE as usize);
+    //     let mut bytes_written = 0;
+    //     let mut records_processed = 0;
+
+    //     // Process records one at a time, writing directly to the buffer
+    //     for offset in 0..max_records {
+    //         let mut local_rng = self.rng.clone();
+    //         local_rng.set_stream(offset);
+    //         let random_number = local_rng.gen_range(0..100);
+
+    //         // Create location data without allocating strings
+    //         let location = BusinessLocationRef {
+    //             id: start_id + offset,
+    //             name: &self.pools.names[random_number],
+    //             industry: &self.pools.industries[random_number],
+    //             revenue: local_rng.gen_range(100000.0..100000000.0),
+    //             employees: local_rng.gen_range(10..10000),
+    //             city: &self.pools.cities[random_number],
+    //             state: &self.pools.states[random_number],
+    //             country: &self.pools.countries[local_rng.gen_range(0..5)],
+    //         };
+
+    //         let start_pos = buffer.len();
+
+    //         // Write directly to the buffer
+    //         match self.format {
+    //             OutputFormat::JSON => {
+    //                 self.write_location_json_simd(&location, &mut buffer);
+    //             }
+    //             OutputFormat::CSV => {
+    //                 self.write_location_csv_simd(&location, &mut buffer);
+    //             }
+    //         }
+
+    //         bytes_written += buffer.len() - start_pos;
+    //         self.bytes_generated += bytes_written as u64;
+    //         records_processed += 1;
+
+    //         if self.bytes_generated >= self.chunk_size {
+    //             break;
+    //         }
+    //     }
+
+    //     self.current_id += records_processed;
+
+    //     if bytes_written > 0 {
+    //         Some(buffer.freeze())
+    //     } else {
+    //         None
+    //     }
+    // }
 
     pub fn estimate_objects_per_chunk(&self) -> u64 {
         let avg_object_size = match self.format {
@@ -132,24 +196,19 @@ impl<'a> StreamGenerator<'a> {
     }
 
     #[inline(always)]
-    pub fn write_location_json_simd(&mut self, location: &BusinessLocation, output: &mut Vec<u8>) {
-        output.push(b',');
+    pub fn write_location_json_simd(
+        &mut self,
+        location: &BusinessLocationRef,
+        buffer: &mut BytesMut,
+    ) {
+        buffer.put_u8(b',');
 
-        let needed_capacity = location.name.len()
-            + location.industry.len()
-            + location.city.len()
-            + location.state.len()
-            + location.country.len()
-            + 128;
+        buffer.put_u8(b'{');
 
-        output.reserve(needed_capacity);
-
+        // Write numeric fields
         let mut id_buf = itoa::Buffer::new();
         let mut emp_buf = itoa::Buffer::new();
         let mut rev_buf = dtoa::Buffer::new();
-        let mut buffer = AlignedBuffer {
-            data: [0; BUFFER_CAPACITY],
-        };
 
         let id_str = id_buf.format(location.id);
         let revenue_str = rev_buf.format(location.revenue);
@@ -160,113 +219,96 @@ impl<'a> StreamGenerator<'a> {
             self.json_patterns.ending_compact,
         );
 
-        unsafe {
-            output.push(b'{');
-
-            let mut write_field_simd = |data: &[u8], dst: &mut Vec<u8>| {
-                for chunk in data.chunks(64) {
-                    _mm_prefetch(chunk.as_ptr() as *const i8, _MM_HINT_T0);
-                    buffer.data[..chunk.len()].copy_from_slice(chunk);
-                    dst.extend_from_slice(&buffer.data[..chunk.len()]);
-                }
-            };
-
-            let numeric_values = [id_str, revenue_str, employees_str];
-
-            for (i, value) in numeric_values.iter().enumerate() {
-                if i > 0 {
-                    output.extend_from_slice(&separator[..]);
-                }
-                write_field_simd(
-                    &self.json_patterns.unquoted_field_patterns[i].prefix
-                        [..self.json_patterns.unquoted_field_patterns[i].prefix_len],
-                    output,
-                );
-                write_field_simd(value.as_bytes(), output);
+        let numeric_values = [id_str, revenue_str, employees_str];
+        for (i, value) in numeric_values.iter().enumerate() {
+            if i > 0 {
+                buffer.extend_from_slice(&separator[..]);
             }
-
-            let string_values = [
-                &location.name,
-                &location.industry,
-                &location.city,
-                &location.state,
-                &location.country,
-            ];
-
-            for (pattern, value) in self
-                .json_patterns
-                .quoted_field_patterns
-                .iter()
-                .zip(string_values.iter())
-            {
-                output.extend_from_slice(&separator[..]);
-                write_field_simd(&pattern.prefix[..], output);
-                write_field_simd(value.as_bytes(), output);
-                write_field_simd(&pattern.suffix[..], output);
-            }
-
-            output.extend_from_slice(&ending[..]);
+            buffer.extend_from_slice(
+                &self.json_patterns.unquoted_field_patterns[i].prefix
+                    [..self.json_patterns.unquoted_field_patterns[i].prefix_len],
+            );
+            buffer.extend_from_slice(value.as_bytes());
         }
+
+        // Write string fields
+        let string_values = [
+            location.name,
+            location.industry,
+            location.city,
+            location.state,
+            location.country,
+        ];
+
+        for (pattern, value) in self
+            .json_patterns
+            .quoted_field_patterns
+            .iter()
+            .zip(string_values.iter())
+        {
+            buffer.extend_from_slice(&separator[..]);
+            buffer.extend_from_slice(&pattern.prefix[..]);
+
+            // Use SIMD for string copy
+            let bytes = value.as_bytes();
+            let chunks = bytes.chunks(BYTE_COUNT);
+            for chunk in chunks {
+                if chunk.len() == BYTE_COUNT {
+                    let simd_chunk = u8x32::from_slice(chunk);
+                    buffer.extend_from_slice(&simd_chunk.to_array());
+                } else {
+                    buffer.extend_from_slice(chunk);
+                }
+            }
+
+            buffer.extend_from_slice(&pattern.suffix[..]);
+        }
+
+        buffer.extend_from_slice(&ending[..]);
     }
 
     #[inline]
-    pub fn write_location_csv_simd(&mut self, location: &BusinessLocation, output: &mut Vec<u8>) {
-        let id_str = location.id.to_string();
-        let revenue_str = location.revenue.to_string();
-        let employees_str = location.employees.to_string();
+    pub fn write_location_csv_simd(
+        &mut self,
+        location: &BusinessLocationRef,
+        buffer: &mut BytesMut,
+    ) {
+        // Write id
+        let mut id_buf = itoa::Buffer::new();
+        let id_str = id_buf.format(location.id);
+        buffer.extend_from_slice(id_str.as_bytes());
+        buffer.put_u8(b',');
 
-        let total_size = id_str.len()
-            + location.name.len()
-            + location.industry.len()
-            + revenue_str.len()
-            + employees_str.len()
-            + location.city.len()
-            + location.state.len()
-            + location.country.len()
-            + 8;
+        // Write string fields with SIMD
+        let string_fields = [
+            location.name,
+            location.industry,
+            &location.revenue.to_string(),
+            &location.employees.to_string(),
+            location.city,
+            location.state,
+            location.country,
+        ];
 
-        output.reserve(total_size);
+        for (i, field) in string_fields.iter().enumerate() {
+            let bytes = field.as_bytes();
+            let chunks = bytes.chunks(BYTE_COUNT);
 
-        self.copy_str_simd(output, &id_str);
-        output.push(b',');
-        self.copy_str_simd(output, &location.name);
-        output.push(b',');
-        self.copy_str_simd(output, &location.industry);
-        output.push(b',');
-        self.copy_str_simd(output, &revenue_str);
-        output.push(b',');
-        self.copy_str_simd(output, &employees_str);
-        output.push(b',');
-        self.copy_str_simd(output, &location.city);
-        output.push(b',');
-        self.copy_str_simd(output, &location.state);
-        output.push(b',');
-        self.copy_str_simd(output, &location.country);
-        output.push(b'\n');
-    }
+            for chunk in chunks {
+                if chunk.len() == BYTE_COUNT {
+                    let simd_chunk = u8x32::from_slice(chunk);
+                    buffer.extend_from_slice(&simd_chunk.to_array());
+                } else {
+                    buffer.extend_from_slice(chunk);
+                }
+            }
 
-    #[inline]
-    fn copy_str_simd(&mut self, output: &mut Vec<u8>, s: &str) {
-        let bytes = s.as_bytes();
-        let len = bytes.len();
-        if len <= BYTE_COUNT {
-            output.extend_from_slice(bytes);
-            return;
+            if i < string_fields.len() - 1 {
+                buffer.put_u8(b',');
+            }
         }
 
-        let chunks = len / BYTE_COUNT;
-        output.reserve(len);
-
-        for chunk in 0..chunks {
-            let offset = chunk * BYTE_COUNT;
-            let simd_chunk = u8x32::from_slice(&bytes[offset..offset + BYTE_COUNT]);
-            output.extend_from_slice(&simd_chunk.to_array());
-        }
-
-        let remaining_start = chunks * BYTE_COUNT;
-        if remaining_start < len {
-            output.extend_from_slice(&bytes[remaining_start..]);
-        }
+        buffer.put_u8(b'\n');
     }
 }
 
@@ -411,10 +453,6 @@ struct QuotedFieldPattern {
 struct UnquotedFieldPattern {
     prefix: [u8; 32],
     prefix_len: usize,
-}
-#[repr(align(32))]
-struct AlignedBuffer {
-    data: [u8; BUFFER_CAPACITY],
 }
 #[repr(align(64))]
 struct AlignedPatterns {

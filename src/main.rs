@@ -45,24 +45,27 @@ async fn generate_data(
         size_info.multiplier,
         size_info.unit,
     ));
-    progress.print_header(stream_content_type);
 
+    if stream_content_type == OutputFormat::CSV {
+        let header = b"id,name,industry,revenue,employees,city,state,country\n";
+        progress.update_streamed(header.len());
+
+        tx.send(Ok(Bytes::from(header.to_vec()))).await.ok();
+    } else {
+        tx.send(Ok(Bytes::from(b"[ ".to_vec()))).await.ok();
+    }
+
+    progress.print_header(stream_content_type);
+    let sender = tx.clone();
     tokio::spawn(async move {
         let seed: u64 = rand::thread_rng().gen();
         let num_threads = num_cpus::get();
         let chunk_size = size_info.total_size / (num_threads as u64);
+
         let other_prog = progress.clone();
+
         let (chunk_tx, chunk_rx) = std_mpsc::sync_channel(16);
-        if stream_content_type == OutputFormat::CSV {
-            let header = b"id,name,industry,revenue,employees,city,state,country\n";
-            progress.update_streamed(header.len());
 
-            tx.send(Ok(Bytes::from(header.to_vec()))).await.ok();
-        } else {
-            tx.send(Ok(Bytes::from(b"[ ".to_vec()))).await.ok();
-        }
-
-        if chunk_tx.send(b"[ ".to_vec()).is_err() {}
         std::thread::spawn(move || {
             let data_pools = DataPools::new();
 
@@ -80,6 +83,7 @@ async fn generate_data(
                 );
 
                 while let Some(chunk) = generator.generate_chunk() {
+                    // println!("{}", chunk.len());
                     other_prog.update(chunk.len());
                     other_prog.print_progress();
 
@@ -93,22 +97,18 @@ async fn generate_data(
         for chunk in chunk_rx {
             progress.update_streamed(chunk.len());
             progress.print_progress();
-            if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
+
+            if sender.send(Ok(Bytes::from(chunk))).await.is_err() {
                 break;
             }
         }
 
-        if stream_content_type == OutputFormat::JSON {
-            progress.update_streamed(chunk_size.try_into().unwrap());
-            tx.send(Ok(Bytes::from(
-                if pretty_print { b"\n]\n" } else { b"  ]" }.to_vec(),
-            )))
-            .await
-            .ok();
-        }
-
         progress.print_progress();
     });
+
+    if stream_content_type == OutputFormat::JSON {
+        tx.send(Ok(Bytes::from(b"  ]".to_vec()))).await.ok();
+    }
 
     let stream = ReceiverStream::new(rx);
 
