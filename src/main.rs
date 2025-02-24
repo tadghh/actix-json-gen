@@ -66,7 +66,7 @@ async fn generate_data(
         let num_chunks = (size_info.total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let other_prog = progress.clone();
 
-        let (chunk_tx, chunk_rx) = std_mpsc::sync_channel(16);
+        let (chunk_tx, chunk_rx) = std_mpsc::sync_channel(0);
 
         std::thread::spawn(move || {
             let data_pools = DataPools::new();
