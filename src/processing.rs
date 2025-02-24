@@ -15,7 +15,7 @@ use std::simd::{cmp::SimdPartialEq, u8x32, u8x64};
 const BYTE_COUNT: usize = 32;
 const POOL_SIZE: i32 = 1000;
 const OPTIMAL_CHUNK_SIZE: u64 = 16 * 1024;
-const MAX_RECORDS_PER_CHUNK: u64 = 1000;
+const MAX_RECORDS_PER_CHUNK: u64 = 256 * 1024 * 1024;
 
 pub struct BusinessLocationRef<'a> {
     name: &'a str,

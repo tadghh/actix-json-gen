@@ -57,11 +57,13 @@ async fn generate_data(
 
     progress.print_header(stream_content_type);
     let sender = tx.clone();
+
     tokio::spawn(async move {
         let seed: u64 = rand::thread_rng().gen();
         let num_threads = num_cpus::get();
         let chunk_size = size_info.total_size / (num_threads as u64);
-
+        const CHUNK_SIZE: u64 = 256 * 1024 * 1024;
+        let num_chunks = (size_info.total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let other_prog = progress.clone();
 
         let (chunk_tx, chunk_rx) = std_mpsc::sync_channel(16);
@@ -81,15 +83,21 @@ async fn generate_data(
                 other_prog.print_progress();
                 chunk_tx.send(chunk).ok();
             }
-            (0..num_threads).into_par_iter().for_each(|i| {
-                let chunk_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
 
+            let chunks: Vec<_> = (0..num_chunks).collect();
+            chunks.into_par_iter().for_each(|i| {
+                let chunk_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
+                let current_chunk_size = if i == num_chunks - 1 {
+                    size_info.total_size - (i * CHUNK_SIZE)
+                } else {
+                    CHUNK_SIZE
+                };
                 let mut generator = StreamGenerator::new(
                     chunk_rng,
                     &data_pools,
                     pretty_print,
                     stream_content_type,
-                    chunk_size,
+                    current_chunk_size,
                 );
 
                 while let Some(chunk) = generator.generate_chunk() {
