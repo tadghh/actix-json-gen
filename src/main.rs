@@ -68,13 +68,23 @@ async fn generate_data(
 
         std::thread::spawn(move || {
             let data_pools = DataPools::new();
+            let mut initial_generator = StreamGenerator::new(
+                ChaCha8Rng::seed_from_u64(seed),
+                &data_pools,
+                pretty_print,
+                stream_content_type,
+                chunk_size,
+            );
 
+            if let Some(chunk) = initial_generator.generate_kickoff_chunk() {
+                other_prog.update(chunk.len());
+                other_prog.print_progress();
+                chunk_tx.send(chunk).ok();
+            }
             (0..num_threads).into_par_iter().for_each(|i| {
                 let chunk_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
-                let start_id = ((i) as u64) * (chunk_size);
 
                 let mut generator = StreamGenerator::new(
-                    start_id,
                     chunk_rng,
                     &data_pools,
                     pretty_print,
@@ -83,7 +93,6 @@ async fn generate_data(
                 );
 
                 while let Some(chunk) = generator.generate_chunk() {
-                    // println!("{}", chunk.len());
                     other_prog.update(chunk.len());
                     other_prog.print_progress();
 
@@ -102,13 +111,11 @@ async fn generate_data(
                 break;
             }
         }
-
+        if stream_content_type == OutputFormat::JSON {
+            tx.send(Ok(Bytes::from(b"  ]".to_vec()))).await.ok();
+        }
         progress.print_progress();
     });
-
-    if stream_content_type == OutputFormat::JSON {
-        tx.send(Ok(Bytes::from(b"  ]".to_vec()))).await.ok();
-    }
 
     let stream = ReceiverStream::new(rx);
 

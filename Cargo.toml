@@ -4,26 +4,26 @@ name   ="fast-json-gen"
 version="0.1.1"
 
 [dependencies]
-actix-web   ={ version="4.9.0", default-features=false, features=["macros"] }
-anyhow      ="1.0.95"
-bytes       ="1.10.0"
-crossbeam-channel = "0.5.14"
-crossterm   ={ version="0.28.1", default-features=false, features=["events", "windows"] }
-dtoa        ="1.0.9"
-fake        ={ version="3.2.0", default-features=false, features=["derive"] }
-futures = "0.3.31"
-itoa        ="1.0.14"
-num-bigint  ="0.4.6"
-num-traits  ="0.2.19"
-num_cpus    ="1.16.0"
-parking_lot ="0.12.3"
-rand        ="0.8.5"
-rand_chacha ="0.3.1"
-rayon       ={ version="1.10.0", default-features=false }
-serde       ={ version="1.0.217", features=["derive"] }
-sysinfo = "0.33.1"
-tokio       ="1.43.0"
-tokio-stream="0.1.17"
+actix-web        ={ version="4.9.0", default-features=false, features=["macros"] }
+anyhow           ="1.0.95"
+bytes            ="1.10.0"
+crossbeam-channel="0.5.14"
+crossterm        ={ version="0.28.1", default-features=false, features=["events", "windows"] }
+dtoa             ="1.0.9"
+fake             ={ version="3.2.0", default-features=false, features=["derive"] }
+futures          ="0.3.31"
+itoa             ="1.0.14"
+num-bigint       ="0.4.6"
+num-traits       ="0.2.19"
+num_cpus         ="1.16.0"
+parking_lot      ="0.12.3"
+rand             ="0.8.5"
+rand_chacha      ="0.3.1"
+rayon            ={ version="1.10.0", default-features=false }
+serde            ={ version="1.0.217", features=["derive"] }
+sysinfo          ="0.33.1"
+tokio            ="1.43.0"
+tokio-stream     ="0.1.17"
 
 [profile.release]
 codegen-units=1
@@ -36,6 +36,6 @@ strip        =true
 [dev-dependencies]
 criterion="0.5"
 
-[[bench]]
-harness=false
-name   ="data_generation"
+# [[bench]]
+# harness=false
+# name   ="data_generation"
