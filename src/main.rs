@@ -39,7 +39,8 @@ async fn generate_data(
 
     let size_info = get_size_info(params.get("size")).map_err(convert_error)?;
     let (tx, rx) = channel::<Result<Bytes, Error>>(16);
-
+    let sender = tx.clone();
+    let stream = ReceiverStream::new(rx);
     let progress = Arc::new(ProgressInfo::new(
         size_info.total_size,
         size_info.multiplier,
@@ -56,7 +57,6 @@ async fn generate_data(
     }
 
     progress.print_header(stream_content_type);
-    let sender = tx.clone();
 
     tokio::spawn(async move {
         let seed: u64 = rand::thread_rng().gen();
@@ -125,7 +125,7 @@ async fn generate_data(
         progress.print_progress();
     });
 
-    let stream = ReceiverStream::new(rx);
+
 
     Ok(HttpResponse::Ok()
         .insert_header(("Content-Type", stream_content_type.content_type()))

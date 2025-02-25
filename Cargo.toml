@@ -7,12 +7,14 @@ version="0.1.1"
 actix-web        ={ version="4.9.0", default-features=false, features=["macros"] }
 anyhow           ="1.0.95"
 bytes            ="1.10.0"
+core_affinity = "0.8.1"
 crossbeam-channel="0.5.14"
 crossterm        ={ version="0.28.1", default-features=false, features=["events", "windows"] }
 dtoa             ="1.0.9"
 fake             ={ version="3.2.0", default-features=false, features=["derive"] }
 futures          ="0.3.31"
 itoa             ="1.0.14"
+lazy_static = "1.5.0"
 num-bigint       ="0.4.6"
 num-traits       ="0.2.19"
 num_cpus         ="1.16.0"
@@ -27,11 +29,11 @@ tokio-stream     ="0.1.17"
 
 [profile.release]
 codegen-units=1
-debug        =false
+debug        =true
 lto          ="thin"
 opt-level    ="z"
 panic        ="abort"
-strip        =true
+# strip        =true
 
 [dev-dependencies]
 criterion="0.5"

@@ -16,7 +16,7 @@ const BYTE_COUNT: usize = 32;
 const POOL_SIZE: i32 = 1000;
 const OPTIMAL_CHUNK_SIZE: u64 = 16 * 1024;
 const MAX_RECORDS_PER_CHUNK: u64 = (256 * 1024 * 1024) / 100;
-
+#[repr(align(64))]
 pub struct BusinessLocationRef<'a> {
     name: &'a str,
     industry: &'a str,
@@ -26,6 +26,7 @@ pub struct BusinessLocationRef<'a> {
     state: &'a str,
     country: &'a str,
 }
+#[repr(align(64))]
 pub struct StreamGenerator<'a> {
     rng: ChaCha8Rng,
     pools: &'a DataPools,
@@ -499,6 +500,7 @@ impl OutputFormat {
     }
 }
 
+#[repr(align(64))]
 pub struct DataPools {
     pub names: Vec<String>,
     pub cities: Vec<String>,
