@@ -34,13 +34,21 @@ async fn main() -> std::io::Result<()> {
 async fn generate_data(
     web::Query(params): web::Query<HashMap<String, String>>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    const CHUNK_SIZE: u64 = 256 * 1024 * 1024;
+
+    let (tx, rx) = channel::<Result<Bytes, Error>>(16);
+    let sender = tx.clone();
+    let stream = ReceiverStream::new(rx);
+
     let stream_content_type = OutputFormat::from_str(params.get("format").map_or("json", |s| s));
     let pretty_print = params.get("pretty").map_or(false, |v| v == "true");
 
     let size_info = get_size_info(params.get("size")).map_err(convert_error)?;
-    let (tx, rx) = channel::<Result<Bytes, Error>>(16);
-    let sender = tx.clone();
-    let stream = ReceiverStream::new(rx);
+
+    let num_threads = num_cpus::get();
+    let chunk_size = size_info.total_size / (num_threads as u64);
+    let num_chunks = (size_info.total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
     let progress = Arc::new(ProgressInfo::new(
         size_info.total_size,
         size_info.multiplier,
@@ -60,10 +68,7 @@ async fn generate_data(
 
     tokio::spawn(async move {
         let seed: u64 = rand::thread_rng().gen();
-        let num_threads = num_cpus::get();
-        let chunk_size = size_info.total_size / (num_threads as u64);
-        const CHUNK_SIZE: u64 = 256 * 1024 * 1024;
-        let num_chunks = (size_info.total_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
         let other_prog = progress.clone();
 
         let (chunk_tx, chunk_rx) = std_mpsc::sync_channel(0);
@@ -124,8 +129,6 @@ async fn generate_data(
         }
         progress.print_progress();
     });
-
-
 
     Ok(HttpResponse::Ok()
         .insert_header(("Content-Type", stream_content_type.content_type()))
